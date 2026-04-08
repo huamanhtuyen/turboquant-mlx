@@ -19,7 +19,15 @@ import uuid
 import argparse
 import threading
 import sys
+import os
+from dataclasses import dataclass, field
 from typing import Iterator, Optional
+
+try:
+    import psutil as _psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 import mlx.core as mx
 from mlx_lm import load
@@ -40,6 +48,122 @@ _tokenizer = None
 _model_id: str = ""
 _bits: int = 8
 _gen_lock = threading.Lock()   # MLX/Metal: serialize all inference calls
+_MAX_PROMPT_TOKENS: int = 8192  # hard cap — override with --max-prompt-tokens
+_req_counter = 0               # global request counter
+
+# ANSI colors
+_C = {
+    "reset":  "\033[0m",
+    "bold":   "\033[1m",
+    "dim":    "\033[2m",
+    "cyan":   "\033[36m",
+    "green":  "\033[32m",
+    "yellow": "\033[33m",
+    "red":    "\033[31m",
+    "blue":   "\033[34m",
+    "magenta":"\033[35m",
+}
+
+
+@dataclass
+class _ReqStats:
+    req_id:          str   = ""
+    endpoint:        str   = ""
+    prompt_tokens:   int   = 0
+    prompt_preview:  str   = ""
+    completion_tokens: int = 0
+    prefill_ms:      float = 0.0
+    decode_s:        float = 0.0
+    cache_mb:        float = 0.0
+    gpu_peak_gb:     float = 0.0
+    ram_gb:          float = 0.0
+    stream:          bool  = False
+
+    @property
+    def tok_per_s(self) -> float:
+        if self.decode_s <= 0 or self.completion_tokens <= 1:
+            return 0.0
+        # decode_s covers tokens 2..N, so use completion_tokens-1
+        return (self.completion_tokens - 1) / self.decode_s
+
+
+def _collect_memory(stats: _ReqStats):
+    """Populate GPU peak and RAM into stats object."""
+    try:
+        stats.gpu_peak_gb = mx.get_peak_memory() / 2**30
+    except AttributeError:
+        try:
+            stats.gpu_peak_gb = mx.metal.get_peak_memory() / 2**30  # type: ignore
+        except Exception:
+            stats.gpu_peak_gb = 0.0
+    if _HAS_PSUTIL:
+        try:
+            stats.ram_gb = _psutil.Process().memory_info().rss / 2**30
+        except Exception:
+            pass
+
+
+def _cache_mb_now() -> float:
+    """Total Metal GPU active memory in MB (model weights + KV cache + activations)."""
+    try:
+        return mx.get_active_memory() / 2**20
+    except AttributeError:
+        try:
+            return mx.metal.get_active_memory() / 2**20  # type: ignore
+        except Exception:
+            return 0.0
+
+
+def _print_stats(stats: _ReqStats, counter: int):
+    """Print a compact, color-coded stats block to console."""
+    C = _C
+    mode = "stream" if stats.stream else "full"
+    tok_s = stats.tok_per_s
+    total_s = (stats.prefill_ms / 1000) + stats.decode_s
+
+    # Speed color
+    if tok_s >= 20:
+        spd_c = C["green"]
+    elif tok_s >= 10:
+        spd_c = C["yellow"]
+    else:
+        spd_c = C["red"]
+
+    sep = C["dim"] + "─" * 64 + C["reset"]
+    print(sep)
+    print(
+        f"{C['bold']}{C['cyan']}#{counter:04d}{C['reset']}  "
+        f"{C['bold']}{stats.endpoint}{C['reset']}  "
+        f"{C['dim']}({mode}){C['reset']}"
+    )
+    # Prompt info
+    preview = stats.prompt_preview[:80].replace("\n", " ")
+    print(
+        f"  {C['dim']}Prompt{C['reset']}   "
+        f"{C['yellow']}{stats.prompt_tokens:,} tok{C['reset']}  "
+        f"{C['dim']}│ {preview!r}{C['reset']}"
+    )
+    # Timing
+    print(
+        f"  {C['dim']}Timing{C['reset']}   "
+        f"prefill {C['blue']}{stats.prefill_ms:.0f}ms{C['reset']}  │  "
+        f"decode  {spd_c}{tok_s:.1f} tok/s{C['reset']}  │  "
+        f"{C['magenta']}{stats.completion_tokens} tokens{C['reset']}  │  "
+        f"total {total_s:.1f}s"
+    )
+    # Memory
+    gpu_str = f"{C['blue']}{stats.gpu_peak_gb:.2f} GB{C['reset']}" if stats.gpu_peak_gb > 0 else "n/a"
+    ram_str = f"{stats.ram_gb:.2f} GB" if stats.ram_gb > 0 else ""
+    # cache_mb = total Metal active memory (model ~4GB + actual KV cache)
+    # Actual KV cache ≈ cache_mb - model_weights; shown as reference only
+    active_str = f"{stats.cache_mb:.0f} MB" if stats.cache_mb > 0 else ""
+    mem_parts = [f"GPU peak {gpu_str}"]
+    if ram_str:
+        mem_parts.append(f"RAM {ram_str}")
+    if active_str:
+        mem_parts.append(f"Metal active {active_str}")
+    print(f"  {C['dim']}Memory{C['reset']}   " + "  │  ".join(mem_parts))
+    print(sep)
 
 
 # ── Model helpers ─────────────────────────────────────────────────────────────
@@ -108,18 +232,32 @@ def _format_prompt(messages: list, tools: Optional[list] = None) -> str:
 
 # ── Core inference (synchronous, must run under _gen_lock) ────────────────────
 
-def _iter_tokens(prompt: str, max_tokens: int, temp: float) -> Iterator[str]:
+def _iter_tokens(prompt: str, max_tokens: int, temp: float,
+                  stats: Optional[_ReqStats] = None) -> Iterator[str]:
     """Yield decoded text fragments token by token.
     Caller is responsible for holding _gen_lock.
+    Optionally populates a _ReqStats object with prefill/decode timing.
     """
     cache = _make_cache()
     input_ids = mx.array(_tokenizer.encode(prompt))[None]
 
+    if stats is not None:
+        # Use new API (mx.reset_peak_memory), fall back to deprecated for older MLX
+        try:
+            mx.reset_peak_memory()
+        except AttributeError:
+            mx.metal.reset_peak_memory()  # type: ignore[attr-defined]
+
     # Prefill
+    t_prefill = time.perf_counter()
     logits = _model(input_ids, cache=cache)
     mx.eval(logits)
+    prefill_ms = (time.perf_counter() - t_prefill) * 1000
 
-    # Sample
+    if stats is not None:
+        stats.prefill_ms = prefill_ms
+
+    # Sample first token
     token = (
         mx.argmax(logits[:, -1, :], axis=-1)
         if temp == 0.0
@@ -127,6 +265,8 @@ def _iter_tokens(prompt: str, max_tokens: int, temp: float) -> Iterator[str]:
     )
 
     eos_id = getattr(_tokenizer, "eos_token_id", None)
+    n_decoded = 0
+    t_decode = time.perf_counter()
 
     for _ in range(max_tokens):
         tid = token.item()
@@ -134,6 +274,7 @@ def _iter_tokens(prompt: str, max_tokens: int, temp: float) -> Iterator[str]:
             break
 
         yield _tokenizer.decode([tid])
+        n_decoded += 1
 
         logits = _model(token.reshape(1, 1), cache=cache)
         mx.eval(logits)
@@ -143,11 +284,18 @@ def _iter_tokens(prompt: str, max_tokens: int, temp: float) -> Iterator[str]:
             else mx.random.categorical(logits[:, -1, :] / temp)
         )
 
+    if stats is not None:
+        stats.decode_s         = time.perf_counter() - t_decode
+        stats.completion_tokens = n_decoded
+        stats.cache_mb          = _cache_mb_now()
+        _collect_memory(stats)
 
-def _run_full(prompt: str, max_tokens: int, temp: float) -> str:
+
+def _run_full(prompt: str, max_tokens: int, temp: float,
+              stats: Optional[_ReqStats] = None) -> str:
     """Generate full response synchronously (non-streaming)."""
     with _gen_lock:
-        parts = list(_iter_tokens(prompt, max_tokens, temp))
+        parts = list(_iter_tokens(prompt, max_tokens, temp, stats=stats))
     return "".join(parts)
 
 
@@ -206,7 +354,8 @@ def _chunk(req_id: str, created: int, delta: dict,
 # ── Streaming generator ───────────────────────────────────────────────────────
 
 async def _stream_response(prompt: str, max_tokens: int, temp: float,
-                            req_id: str, created: int):
+                            req_id: str, created: int,
+                            stats: Optional[_ReqStats] = None):
     """Async SSE generator. Runs MLX inference in a background thread."""
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -214,7 +363,7 @@ async def _stream_response(prompt: str, max_tokens: int, temp: float,
     def _worker():
         try:
             with _gen_lock:
-                for text in _iter_tokens(prompt, max_tokens, temp):
+                for text in _iter_tokens(prompt, max_tokens, temp, stats=stats):
                     loop.call_soon_threadsafe(queue.put_nowait, text)
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -357,6 +506,7 @@ async def get_model(model_id: str):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    global _req_counter
     try:
         body = await request.json()
     except Exception:
@@ -374,10 +524,52 @@ async def chat_completions(request: Request):
     prompt = _format_prompt(messages, tools=tools)
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    _req_counter += 1
+    counter = _req_counter
+
+    # Build stats object — prompt info populated here, rest filled during inference
+    prompt_tokens = len(_tokenizer.encode(prompt))
+    # Extract a readable preview from the last user message
+    last_user = next(
+        (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+        prompt,
+    )
+    stats = _ReqStats(
+        req_id=req_id,
+        endpoint="/v1/chat/completions",
+        prompt_tokens=prompt_tokens,
+        prompt_preview=str(last_user)[:200],
+        stream=stream,
+    )
+
+    # ── Hard cap on prompt size ───────────────────────────────────────
+    if prompt_tokens > _MAX_PROMPT_TOKENS:
+        C = _C
+        original_tokens = prompt_tokens
+        # Truncate token ids then decode back to string
+        token_ids = _tokenizer.encode(prompt)
+        # Keep last _MAX_PROMPT_TOKENS tokens (tail = most recent context)
+        kept_ids = token_ids[-_MAX_PROMPT_TOKENS:]
+        prompt = _tokenizer.decode(kept_ids)
+        prompt_tokens = len(kept_ids)
+        stats.prompt_tokens = prompt_tokens
+        print(
+            f"\n{C['bold']}{C['red']}⚠ PROMPT TRUNCATED{C['reset']}  "
+            f"{original_tokens:,} → {prompt_tokens:,} tokens  "
+            f"{C['dim']}(limit: {_MAX_PROMPT_TOKENS:,} | use --max-prompt-tokens N to change){C['reset']}"
+        )
 
     if stream:
+        async def _streaming_with_stats():
+            async for chunk in _stream_response(
+                prompt, max_tokens, temperature, req_id, created, stats=stats
+            ):
+                yield chunk
+            # Print stats after stream completes
+            _print_stats(stats, counter)
+
         return StreamingResponse(
-            _stream_response(prompt, max_tokens, temperature, req_id, created),
+            _streaming_with_stats(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -389,8 +581,9 @@ async def chat_completions(request: Request):
     # Non-streaming
     loop = asyncio.get_event_loop()
     full_text = await loop.run_in_executor(
-        None, _run_full, prompt, max_tokens, temperature
+        None, _run_full, prompt, max_tokens, temperature, stats
     )
+    _print_stats(stats, counter)
 
     tool_calls, content = _parse_tool_calls(full_text)
     finish_reason = "tool_calls" if tool_calls else "stop"
@@ -399,9 +592,6 @@ async def chat_completions(request: Request):
     if tool_calls:
         message["tool_calls"] = tool_calls
         message["content"] = None
-
-    prompt_tokens = len(_tokenizer.encode(prompt))
-    completion_tokens = len(_tokenizer.encode(full_text))
 
     return {
         "id": req_id,
@@ -415,8 +605,8 @@ async def chat_completions(request: Request):
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
+            "completion_tokens": stats.completion_tokens or len(_tokenizer.encode(full_text)),
+            "total_tokens": prompt_tokens + (stats.completion_tokens or len(_tokenizer.encode(full_text))),
         },
     }
 
@@ -830,6 +1020,9 @@ Examples:
   # FP16 baseline (no compression)
   python server.py --bits 0
 
+  # Limit prompt size (prevent Kilo Code / Cursor from sending 15k token prompts)
+  python server.py --max-prompt-tokens 6000
+
   # Expose to local network
   python server.py --host 0.0.0.0 --port 8080
         """,
@@ -845,11 +1038,19 @@ Examples:
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
+    parser.add_argument(
+        "--max-prompt-tokens", type=int, default=8192,
+        help="Hard cap on prompt length in tokens. Prompts exceeding this are "
+             "truncated from the front (keeping most recent context). "
+             "Set lower (e.g. 4096) if Kilo Code sends huge codebase context. (default: 8192)",
+    )
     parser.add_argument("--log-level", default="info",
                         choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()
 
+    global _MAX_PROMPT_TOKENS
     _load_model(args.model, args.bits)
+    _MAX_PROMPT_TOKENS = args.max_prompt_tokens
 
     short = args.model.split("/")[-1]
     cache_label = "FP16" if args.bits == 0 else f"TurboQuant {args.bits}-bit"
@@ -858,9 +1059,10 @@ Examples:
 ╔══════════════════════════════════════════════════════════╗
 ║          TurboQuant-MLX API Server  🚀                   ║
 ╠══════════════════════════════════════════════════════════╣
-║  Model  : {args.model:<46} ║
-║  Cache  : {cache_label:<46} ║
-║  URL    : http://{args.host}:{args.port:<39} ║
+║  Model     : {args.model:<43} ║
+║  Cache     : {cache_label:<43} ║
+║  Prompt cap: {args.max_prompt_tokens:<,} tokens{'':<30} ║
+║  URL       : http://{args.host}:{args.port:<36} ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Kilo Code / Cursor / Continue.dev config:               ║
 ║    Provider : OpenAI Compatible                          ║
