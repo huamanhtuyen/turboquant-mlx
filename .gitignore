@@ -1,6 +1,60 @@
-__pycache__/
-*.pyc
+# ─── Python venv ─────────────────────────────────────────────────────────────
+tq29/
 .venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
 *.egg-info/
-build/
 dist/
+build/
+*.egg
+.eggs/
+
+# ─── MLX / HuggingFace model cache ──────────────────────────────────────────
+# Model weights (hàng GB)
+*.safetensors
+*.safetensors.index.json
+*.bin
+*.pt
+*.pth
+*.gguf
+*.ggml
+
+# HF cache dir (thường ở ~/.cache/huggingface, nhưng để chắc)
+.cache/
+huggingface/
+
+# ─── macOS ───────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ─── IDE / Editor ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Logs / Temp ─────────────────────────────────────────────────────────────
+*.log
+*.tmp
+/tmp/
+.tmp/
+
+# ─── Jupyter ─────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─── Large data / checkpoints ────────────────────────────────────────────────
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pkl
+*.pickle
