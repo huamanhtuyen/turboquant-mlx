@@ -25,9 +25,11 @@ import mlx.core as mx
 from mlx_lm import load
 from turbo_cache import TurboQuantCache
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 import uvicorn
 
 
@@ -283,11 +285,27 @@ async def _stream_response(prompt: str, max_tokens: int, temp: float,
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
+class _PrefixFixMiddleware(BaseHTTPMiddleware):
+    """Rewrite double-prefix paths like /v1/v1/models → /v1/models.
+    Some clients (Kilo Code, etc.) append /v1 to a Base URL that already
+    contains /v1, producing invalid doubled paths.
+    """
+    async def dispatch(self, request: Request, call_next):
+        path = request.scope["path"]
+        # Strip one leading /v1 if the path starts with /v1/v1/
+        if path.startswith("/v1/v1/"):
+            request.scope["path"] = path[3:]  # e.g. /v1/v1/models → /v1/models
+        return await call_next(request)
+
+
 app = FastAPI(
     title="TurboQuant-MLX API",
     description="OpenAI-compatible local API with KV cache compression",
     version="1.0.0",
 )
+
+# Must be added BEFORE CORSMiddleware so it runs first
+app.add_middleware(_PrefixFixMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -500,6 +518,35 @@ async def ollama_tags():
     }
 
 
+@app.post("/api/show")
+async def ollama_show(request: Request):
+    """Ollama POST /api/show — return model metadata."""
+    short_name = _model_id.split("/")[-1]
+    return {
+        "model": short_name,
+        "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "template": "",
+        "details": {
+            "parent_model": _model_id,
+            "format": "mlx",
+            "family": "qwen",
+            "families": ["qwen"],
+            "parameter_size": "7B",
+            "quantization_level": f"{_bits}bit" if _bits > 0 else "fp16",
+        },
+        "model_info": {
+            "general.architecture": "qwen2",
+            "general.name": short_name,
+        },
+    }
+
+
+@app.post("/api/show/{model_name:path}")
+async def ollama_show_named(model_name: str):
+    """Ollama GET /api/show/<name> variant."""
+    return await ollama_show(None)
+
+
 @app.post("/api/chat")
 async def ollama_chat(request: Request):
     """Ollama /api/chat → forward to OpenAI handler."""
@@ -634,6 +681,136 @@ async def ollama_generate(request: Request):
         "response": text,
         "done": True,
     }
+
+
+# ── LM Studio WebSocket endpoints ───────────────────────────────────────────────
+# Kilo Code in "LM Studio" mode connects to /system and /llm via WebSocket.
+# /system  — heartbeat / hardware info channel
+# /llm     — streaming inference channel (JSON-RPC style, LM Studio SDK protocol)
+
+@app.websocket("/system")
+async def ws_system(ws: WebSocket):
+    """LM Studio /system WebSocket — hardware/status heartbeat."""
+    await ws.accept()
+    try:
+        # Send initial system greeting expected by LM Studio SDK
+        greeting = {
+            "type": "serverStatus",
+            "status": "ready",
+            "model": _model_id,
+            "gpuInfo": [{"name": "Apple M-series", "totalMemory": 16384}],
+            "cpuInfo": {"numPhysicalCores": 8, "numLogicalCores": 8},
+        }
+        await ws.send_json(greeting)
+
+        # Keep-alive loop: respond to any pings
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=30.0)
+                msg_type = msg.get("type", "")
+                if msg_type == "ping":
+                    await ws.send_json({"type": "pong"})
+                elif msg_type == "keepAlive":
+                    await ws.send_json({"type": "keepAliveAck"})
+                else:
+                    # Echo unknown messages as ack
+                    await ws.send_json({"type": "ack", "echo": msg_type})
+            except asyncio.TimeoutError:
+                # Send heartbeat
+                await ws.send_json({"type": "ping"})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+
+
+@app.websocket("/llm")
+async def ws_llm(ws: WebSocket):
+    """LM Studio /llm WebSocket — streaming inference channel.
+
+    LM Studio SDK protocol (simplified):
+      client → server:  {type: "predict", extra: {requestId}, params: {messages, ...}}
+      server → client:  {type: "fragment", requestId, fragment: {content: "..."}}
+                         {type: "success", requestId}  (when done)
+    """
+    await ws.accept()
+    loop = asyncio.get_event_loop()
+
+    try:
+        while True:
+            try:
+                msg = await ws.receive_json()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+
+            msg_type = msg.get("type", "")
+
+            if msg_type in ("predict", "chat", "completions"):
+                extra = msg.get("extra", {})
+                params = msg.get("params", msg)  # some versions inline params
+                request_id = extra.get("requestId", str(uuid.uuid4()))
+                messages = params.get("messages", [])
+                max_tokens = params.get("max_tokens") or params.get("maxPredictedTokens") or 1024
+                temperature = float(params.get("temperature", 0.0))
+
+                if not messages:
+                    await ws.send_json({"type": "error", "requestId": request_id,
+                                        "error": "messages is required"})
+                    continue
+
+                prompt = _format_prompt(messages)
+                queue: asyncio.Queue = asyncio.Queue()
+
+                def _worker():
+                    try:
+                        with _gen_lock:
+                            for tok in _iter_tokens(prompt, max_tokens, temperature):
+                                loop.call_soon_threadsafe(queue.put_nowait, tok)
+                    except Exception as exc:
+                        loop.call_soon_threadsafe(queue.put_nowait, exc)
+                    finally:
+                        loop.call_soon_threadsafe(queue.put_nowait, None)
+
+                threading.Thread(target=_worker, daemon=True).start()
+
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        await ws.send_json({
+                            "type": "error", "requestId": request_id,
+                            "error": str(item),
+                        })
+                        break
+                    # Stream fragment
+                    await ws.send_json({
+                        "type": "fragment",
+                        "requestId": request_id,
+                        "fragment": {"content": item},
+                    })
+
+                # Done
+                await ws.send_json({
+                    "type": "success",
+                    "requestId": request_id,
+                    "stats": {"stop_reason": "end"},
+                })
+
+            elif msg_type == "keepAlive":
+                await ws.send_json({"type": "keepAliveAck"})
+
+            elif msg_type == "ping":
+                await ws.send_json({"type": "pong"})
+
+            else:
+                # Unknown message — ack gracefully
+                await ws.send_json({"type": "ack", "receivedType": msg_type})
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
