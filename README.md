@@ -4,10 +4,10 @@ KV cache compression cho MLX-LM, chạy trên Apple Silicon. Drop-in replacement
 
 ## Kết quả thực tế (Qwen2.5-7B-Instruct-4bit, M4 16GB)
 
-| Config | tok/s | Cache MB | Output |
-|--------|------:|--------:|--------|
-| FP16 baseline | 22.2 | 7.9 MB | ✅ Coherent |
-| **TQ 8-bit** | **22.1** | **4.5 MB** | ✅ Identical |
+| Config        |    tok/s |   Cache MB | Output      |
+| ------------- | -------: | ---------: | ----------- |
+| FP16 baseline |     22.2 |     7.9 MB | ✅ Coherent  |
+| **TQ 8-bit**  | **22.1** | **4.5 MB** | ✅ Identical |
 
 - **1.8x cache compression**, 0% speed loss
 - Prefill nhanh hơn ~42% (477ms → 277ms)
@@ -36,6 +36,7 @@ pip install mlx mlx-lm psutil
 ### Interactive chat
 
 ```bash
+source tq29/bin/activate
 # Chat với 8-bit cache (mặc định, recommended)
 python run.py
 
@@ -104,12 +105,12 @@ TurboQuantCache(
 )
 ```
 
-| Method/Property | Mô tả |
-|----------------|-------|
-| `update_and_fetch(k, v)` | Lưu và trả về toàn bộ K/V (giống KVCache) |
-| `offset` | Số tokens đã cached |
-| `nbytes` | Dung lượng cache hiện tại (bytes) |
-| `state` | Tuple (k_buf, v_buf) — dùng cho serialization |
+| Method/Property          | Mô tả                                         |
+| ------------------------ | --------------------------------------------- |
+| `update_and_fetch(k, v)` | Lưu và trả về toàn bộ K/V (giống KVCache)     |
+| `offset`                 | Số tokens đã cached                           |
+| `nbytes`                 | Dung lượng cache hiện tại (bytes)             |
+| `state`                  | Tuple (k_buf, v_buf) — dùng cho serialization |
 
 ---
 
