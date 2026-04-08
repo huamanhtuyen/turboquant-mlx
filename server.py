@@ -659,8 +659,8 @@ Examples:
     )
     parser.add_argument(
         "--model",
-        default="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
-        help="HuggingFace model repo (default: Qwen2.5-Coder-7B-Instruct-4bit)",
+        default="mlx-community/Qwen2.5-7B-Instruct-4bit",
+        help="HuggingFace model repo (default: Qwen2.5-7B-Instruct-4bit)",
     )
     parser.add_argument(
         "--bits", type=int, default=8, choices=[0, 4, 8],
