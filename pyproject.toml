@@ -13,12 +13,21 @@ dependencies = [
     "mlx>=0.20.0",
 ]
 
+[project.scripts]
+turboquant-server = "server:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
 ]
 mlx-lm = [
     "mlx-lm>=0.20.0",
+]
+server = [
+    "mlx-lm>=0.20.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "psutil",
 ]
 
 [tool.setuptools.packages.find]

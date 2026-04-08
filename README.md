@@ -74,6 +74,84 @@ python run.py --benchmark --model mlx-community/Qwen2.5-3B-Instruct-4bit
 
 ---
 
+## API Server (OpenAI-compatible)
+
+Chạy local API server để tích hợp với **Kilo Code, Cursor, Continue.dev, OpenClaw**:
+
+```bash
+source tq29/bin/activate
+
+# Kilo Code / Cursor — Qwen2.5-Coder (coding assistant)
+python server.py
+
+# Hermes agent / OpenClaw — function calling & MCP
+python server.py --model mlx-community/Hermes-3-Llama-3.1-8B-8bit --bits 8
+
+# FP16 baseline (không nén)
+python server.py --bits 0
+
+# Expose ra local network
+python server.py --host 0.0.0.0 --port 8080
+```
+
+### Kết nối Kilo Code (VS Code)
+
+1. Mở Kilo Code panel → Settings
+2. Chọn provider: **OpenAI Compatible**
+3. Điền:
+   - **Base URL**: `http://127.0.0.1:8080/v1`
+   - **API Key**: `not-needed`
+   - **Model ID**: `Qwen2.5-Coder-7B-Instruct-4bit`
+4. Save → sử dụng ngay
+
+### Endpoints có sẵn
+
+| Endpoint | Mô tả |
+| -------- | ----- |
+| `GET  /health` | Kiểm tra server |
+| `GET  /v1/models` | Liệt kê model (OpenAI) |
+| `POST /v1/chat/completions` | Chat + streaming SSE (OpenAI) |
+| `POST /v1/completions` | Raw completion (OpenAI) |
+| `GET  /api/tags` | Liệt kê model (Ollama) |
+| `POST /api/chat` | Chat (Ollama) |
+| `POST /api/generate` | Generate (Ollama) |
+
+### Tool Calling (Qwen2.5-Coder / Hermes)
+
+Server tự động parse `<tool_call>` XML output và convert sang OpenAI `tool_calls` format:
+
+```python
+# Client gửi tools như OpenAI chuẩn
+client.chat.completions.create(
+    model="Qwen2.5-Coder-7B-Instruct-4bit",
+    messages=[{"role": "user", "content": "Đọc file main.py"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+        }
+    }]
+)
+# Server tự inject tool definitions vào system prompt,
+# parse <tool_call>...</tool_call> output, trả về OpenAI tool_calls format
+```
+
+---
+
+## Cấu trúc file
+
+```
+turboquant-mlx/
+├── turbo_cache.py      # TurboQuantCache — cache implementation chính
+├── run.py              # Interactive chat + benchmark CLI
+├── server.py           # OpenAI-compatible API server
+├── README.md           # Tài liệu này
+└── tq29/               # Python venv (không commit)
+```
+
+---
+
 ## Dùng trong code
 
 ```python
