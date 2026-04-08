@@ -1,3 +1,9 @@
+# ─── Project-specific ────────────────────────────────────────────────────────
+turboquant_mlx.egg-info/
+turboquant-mlx/
+__pycache__/
+*.egg-info/
+
 # ─── Python venv ─────────────────────────────────────────────────────────────
 tq29/
 .venv/
