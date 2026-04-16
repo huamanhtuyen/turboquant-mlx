@@ -32,8 +32,24 @@ def make_turbo_cache(model, bits=4):
     return [TurboQuantCache(model.head_dim, n, bits=bits) for n in kv_heads]
 
 
+def _format_messages(tokenizer, messages):
+    """Apply chat template to a list of messages, returning a formatted string."""
+    if hasattr(tokenizer, 'apply_chat_template'):
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    # Fallback for tokenizers without chat template
+    parts = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        parts.append(f"<|{role}|>\n{content}")
+    parts.append("<|assistant|>\n")
+    return "\n".join(parts)
+
+
 def generate(model, tokenizer, prompt, cache_list, max_tokens=200, temp=0.0, stream=False):
-    """Generate text with custom KV cache."""
+    """Generate text with custom KV cache (single-turn, stateless)."""
     if hasattr(tokenizer, 'apply_chat_template'):
         messages = [{"role": "user", "content": prompt}]
         formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -90,6 +106,70 @@ def generate(model, tokenizer, prompt, cache_list, max_tokens=200, temp=0.0, str
         "prompt_tokens": n_prompt,
         "prefill_ms": prefill_time * 1000,
         "decode_tok_s": n_decode / decode_time if decode_time > 0 else 0,
+    }
+
+
+def generate_incremental(model, tokenizer, new_ids, cache_list,
+                         max_tokens=200, temp=0.0, stream=False):
+    """Prefill only new_ids into an existing cache, then decode response.
+
+    Used for stateful multi-turn chat: cache accumulates KV state across turns
+    so each call only processes the tokens added since the last turn.
+
+    Returns:
+        dict with keys: text, n_decode, n_prompt, prefill_ms, decode_tok_s
+        n_cache_added: total tokens added to the cache this call
+                       (= n_prompt + n_decode, for caller to track offset)
+    """
+    input_ids = mx.array(new_ids)[None]
+    n_prompt = len(new_ids)
+
+    # Prefill new tokens
+    t0 = time.perf_counter()
+    logits = model(input_ids, cache=cache_list)
+    mx.eval(logits)
+    prefill_ms = (time.perf_counter() - t0) * 1000
+
+    # Sample first response token
+    if temp == 0:
+        token = mx.argmax(logits[:, -1, :], axis=-1)
+    else:
+        token = mx.random.categorical(logits[:, -1, :] / temp)
+
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    response_ids = []
+    t0 = time.perf_counter()
+
+    for _ in range(max_tokens):
+        tid = token.item()
+        if eos_id is not None and tid == eos_id:
+            break
+
+        response_ids.append(tid)
+        if stream:
+            sys.stdout.write(tokenizer.decode([tid]))
+            sys.stdout.flush()
+
+        # Feed this token to model → get distribution for NEXT token
+        logits = model(token.reshape(1, 1), cache=cache_list)
+        mx.eval(logits)
+        if temp == 0:
+            token = mx.argmax(logits[:, -1, :], axis=-1)
+        else:
+            token = mx.random.categorical(logits[:, -1, :] / temp)
+
+    decode_time = time.perf_counter() - t0
+    n_decode = len(response_ids)
+
+    return {
+        "text": tokenizer.decode(response_ids),
+        "n_decode": n_decode,
+        "n_prompt": n_prompt,
+        "prefill_ms": prefill_ms,
+        "decode_tok_s": n_decode / decode_time if decode_time > 0 else 0,
+        # Caller adds this to cache_token_count:
+        # n_prompt new prefill tokens + n_decode response tokens fed as input
+        "n_cache_added": n_prompt + n_decode,
     }
 
 
@@ -179,12 +259,17 @@ def chat(model, tokenizer, args):
     print(f"{'=' * 70}")
     bits = args.bits
     name = "FP16 baseline" if bits == 0 else f"TQ {bits}-bit"
+    mode = "stateless (--reset-cache)" if args.reset_cache else "stateful (multi-turn)"
     print(f"  Model: {args.model}")
-    print(f"  Cache: {name}")
+    print(f"  Cache: {name}  |  Mode: {mode}")
     print(f"  Type 'quit' to exit, 'reset' to clear context")
     print(f"{'=' * 70}\n")
 
-    cache_list = make_turbo_cache(model, bits=bits)
+    def _new_session():
+        """Return a fresh cache + empty conversation state."""
+        return make_turbo_cache(model, bits=bits), [], 0
+
+    cache_list, messages, cache_token_count = _new_session()
 
     while True:
         try:
@@ -198,21 +283,44 @@ def chat(model, tokenizer, args):
         if prompt.strip().lower() == "quit":
             break
         if prompt.strip().lower() == "reset":
-            cache_list = make_turbo_cache(model, bits=bits)
-            print("[Cache reset]\n")
+            cache_list, messages, cache_token_count = _new_session()
+            print("[Context reset]\n")
             continue
 
-        # Fresh cache per turn (no multi-turn for simplicity)
-        cache_list = make_turbo_cache(model, bits=bits)
+        messages.append({"role": "user", "content": prompt})
+
+        if args.reset_cache:
+            # ── Stateless mode: fresh cache every turn ────────────────────────
+            # Re-encode full conversation history each call (tool/script use)
+            cache_list, _, cache_token_count = _new_session()
+            full_ids = tokenizer.encode(_format_messages(tokenizer, messages))
+            new_ids = full_ids  # process everything from scratch
+        else:
+            # ── Stateful mode: incremental prefill on existing cache ───────────
+            # Only encode + prefill the tokens added since last turn
+            full_ids = tokenizer.encode(_format_messages(tokenizer, messages))
+            new_ids = full_ids[cache_token_count:]
+
+        if not new_ids:
+            print("[Warning: no new tokens to process]\n")
+            continue
 
         print()
-        r = generate(model, tokenizer, prompt, cache_list,
-                     max_tokens=args.max_tokens, temp=args.temp, stream=True)
+        r = generate_incremental(model, tokenizer, new_ids, cache_list,
+                                 max_tokens=args.max_tokens, temp=args.temp, stream=True)
         print()
+
+        # Track cache offset for next turn (only in stateful mode)
+        if not args.reset_cache:
+            cache_token_count += r["n_cache_added"]
+
+        # Append clean response text to history (without EOS)
+        messages.append({"role": "assistant", "content": r["text"]})
 
         c_mb = cache_mb(cache_list)
-        print(f"\n  [{r['tokens']} tokens | {r['decode_tok_s']:.1f} tok/s | "
-              f"cache: {c_mb:.1f} MB | {mem_info()}]\n")
+        turn_info = f"turn {len(messages) // 2}" if not args.reset_cache else "stateless"
+        print(f"  [{r['n_decode']} tokens | {r['decode_tok_s']:.1f} tok/s | "
+              f"cache: {c_mb:.1f} MB | {turn_info} | {mem_info()}]\n")
 
 
 # ─── Main ───────────────────────────────────────────────────────────
@@ -225,6 +333,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=200)
     parser.add_argument("--temp", type=float, default=0.0)
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark comparison")
+    parser.add_argument(
+        "--reset-cache", action="store_true", default=False,
+        help="Reset KV cache after every turn (stateless, single-turn mode). "
+             "Use this when calling the model from scripts/tools. "
+             "Default: off (stateful multi-turn — cache is kept across turns)."
+    )
     args = parser.parse_args()
 
     print(f"\nLoading {args.model}...")
